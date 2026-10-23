@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Check in · Team Attendance{% endblock %}
+{% block content %}
+  <section class="card">
+    <h1>Check in</h1>
+    <p>Choose your name and tap <strong>Check in</strong>. Your browser will then request your location to calculate the distance from the configured office. The app stores the check-in status, rounded distance, and time—not your coordinates.</p>
+    {% if not office_configured %}
+      <div class="notice error">The office location has not been configured yet. Check-in is unavailable.</div>
+    {% elif not roster %}
+      <div class="notice error">The team roster is not configured yet. Add names to ATTENDANCE_ROSTER before check-in.</div>
+    {% else %}
+      <form id="checkin-form" action="{{ url_for('check_in') }}" method="post">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <label for="roster-id">Your name</label>
+        <select id="roster-id" name="name" required>
+          <option value="">Select your name</option>
+          {% for person in roster %}
+            <option value="{{ person }}">{{ person }}</option>
+          {% endfor %}
+        </select>
+        <label for="details">Additional details (optional)</label>
+        <input id="details" name="details" type="text" maxlength="300" placeholder="For example, team or a short note">
+        <input id="latitude" name="latitude" type="hidden">
+        <input id="longitude" name="longitude" type="hidden">
+        <button id="checkin-button" type="button">Check in</button>
+      </form>
+      <p id="location-message" class="muted" aria-live="polite"></p>
+      <script>
+        const button = document.getElementById("checkin-button");
+        button.addEventListener("click", () => {
+          const message = document.getElementById("location-message");
+          const form = document.getElementById("checkin-form");
+          if (!form.reportValidity()) return;
+          if (!navigator.geolocation) {
+            message.textContent = "This browser does not support location access.";
+            return;
+          }
+          button.disabled = true;
+          message.textContent = "Getting your location…";
+          navigator.geolocation.getCurrentPosition(
+            (position) => {
+              document.getElementById("latitude").value = position.coords.latitude;
+              document.getElementById("longitude").value = position.coords.longitude;
+              form.requestSubmit();
+            },
+            (error) => {
+              button.disabled = false;
+              message.textContent = error.code === error.PERMISSION_DENIED
+                ? "Location permission was denied. Allow it in your browser settings and try again."
+                : "Could not get your location. Check your device settings and try again.";
+            },
+            { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+          );
+        });
+      </script>
+    {% endif %}
+  </section>
+{% endblock %}
