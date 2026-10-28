@@ -1,7 +1,10 @@
 import argparse
+from email.message import EmailMessage
 import hmac
 import os
 import secrets
+import smtplib
+import ssl
 import sqlite3
 from datetime import datetime, time, timezone
 from math import asin, cos, isfinite, radians, sin, sqrt
@@ -20,6 +23,7 @@ from flask import (
     session,
     url_for,
 )
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 
 app = Flask(__name__)
@@ -38,6 +42,50 @@ app.config.update(
         str(Path(__file__).with_name("attendance.sqlite3")),
     ),
 )
+DEVICE_COOKIE_NAME = "attendance_device"
+DEVICE_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
+
+
+def device_serializer():
+    return URLSafeTimedSerializer(app.config["SECRET_KEY"], salt="attendance-device")
+
+
+def get_device_identity():
+    signed_token = request.cookies.get(DEVICE_COOKIE_NAME)
+    if signed_token:
+        try:
+            token = device_serializer().loads(
+                signed_token,
+                max_age=DEVICE_COOKIE_MAX_AGE,
+            )
+            if isinstance(token, str) and token:
+                device_key = hmac.new(
+                    str(app.config["SECRET_KEY"]).encode("utf-8"),
+                    token.encode("utf-8"),
+                    "sha256",
+                ).hexdigest()
+                return token, device_key, False
+        except (BadSignature, SignatureExpired):
+            pass
+    token = secrets.token_urlsafe(32)
+    device_key = hmac.new(
+        str(app.config["SECRET_KEY"]).encode("utf-8"),
+        token.encode("utf-8"),
+        "sha256",
+    ).hexdigest()
+    return token, device_key, True
+
+
+def set_device_cookie(response, token):
+    response.set_cookie(
+        DEVICE_COOKIE_NAME,
+        device_serializer().dumps(token),
+        max_age=DEVICE_COOKIE_MAX_AGE,
+        httponly=True,
+        secure=app.config["SESSION_COOKIE_SECURE"],
+        samesite="Lax",
+    )
+    return response
 
 
 def get_roster():
@@ -88,7 +136,7 @@ def get_timezone():
 
 def get_radius():
     try:
-        radius = float(os.environ.get("GEOFENCE_RADIUS_METERS", "150"))
+        radius = float(os.environ.get("GEOFENCE_RADIUS_METERS", "200"))
     except ValueError as error:
         raise RuntimeError("GEOFENCE_RADIUS_METERS must be a positive number.") from error
     if not isfinite(radius) or radius <= 0:
@@ -98,7 +146,7 @@ def get_radius():
 
 def get_cutoff():
     try:
-        return time.fromisoformat(os.environ.get("ATTENDANCE_CUTOFF", "09:00"))
+        return time.fromisoformat(os.environ.get("ATTENDANCE_CUTOFF", "09:30"))
     except ValueError as error:
         raise RuntimeError("ATTENDANCE_CUTOFF must be in HH:MM format.") from error
 
@@ -132,6 +180,19 @@ def initialize_database():
                 details TEXT NOT NULL DEFAULT '',
                 UNIQUE(roster_key, work_date)
             )
+            """
+        )
+        columns = {
+            row[1]
+            for row in database.execute("PRAGMA table_info(attendance)").fetchall()
+        }
+        if "device_key" not in columns:
+            database.execute("ALTER TABLE attendance ADD COLUMN device_key TEXT")
+        database.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_device_day
+            ON attendance(device_key, work_date)
+            WHERE device_key IS NOT NULL
             """
         )
         database.commit()
@@ -214,14 +275,191 @@ def build_report(work_date):
     }
 
 
+def send_attendance_email(report):
+    settings = {}
+    for name in (
+        "REPORT_TO",
+        "SMTP_FROM",
+        "SMTP_HOST",
+        "SMTP_USERNAME",
+        "SMTP_PASSWORD",
+    ):
+        value = os.environ.get(name, "").strip()
+        if not value:
+            raise RuntimeError(f"Missing required email setting: {name}")
+        settings[name] = value
+
+    try:
+        port = int(os.environ.get("SMTP_PORT", "587"))
+    except ValueError as error:
+        raise RuntimeError("SMTP_PORT must be a valid port number.") from error
+    if not 1 <= port <= 65535:
+        raise RuntimeError("SMTP_PORT must be between 1 and 65535.")
+
+    present = "\n".join(f"- {name}" for name in report["present"]) or "- None"
+    action_required = (
+        "\n".join(
+            f"- {item['name']} ({item['reason']})"
+            for item in report["action_required"]
+        )
+        or "- None"
+    )
+    message = EmailMessage()
+    message["Subject"] = f"Attendance report - {report['date']}"
+    message["From"] = settings["SMTP_FROM"]
+    message["To"] = settings["REPORT_TO"]
+    message.set_content(
+        f"Attendance report for {report['date']} "
+        f"(cutoff {report['cutoff']} {report['timezone']})\n\n"
+        f"Present in office:\n{present}\n\n"
+        f"Action required:\n{action_required}\n"
+    )
+
+    with smtplib.SMTP(settings["SMTP_HOST"], port, timeout=30) as smtp:
+        smtp.starttls(context=ssl.create_default_context())
+        smtp.login(settings["SMTP_USERNAME"], settings["SMTP_PASSWORD"])
+        smtp.send_message(message)
+
+
+def build_admin_day(work_date):
+    timezone_info = get_timezone()
+    cutoff = get_cutoff()
+    records = get_db().execute(
+        """
+        SELECT employee_name, checked_in_at_utc, status, distance_meters, details
+        FROM attendance
+        WHERE work_date = ?
+        """,
+        (work_date.isoformat(),),
+    ).fetchall()
+    checkins = {row["employee_name"].casefold(): row for row in records}
+    entries = []
+    for name in get_roster():
+        record = checkins.get(name.casefold())
+        if record is None:
+            entries.append(
+                {
+                    "name": name,
+                    "status": "No check-in",
+                    "checked_in_at": None,
+                    "distance_meters": None,
+                    "details": "",
+                }
+            )
+            continue
+        checked_in = datetime.fromisoformat(record["checked_in_at_utc"]).astimezone(
+            timezone_info
+        )
+        if record["status"] != "In Office":
+            status = "Outside radius"
+        elif checked_in.date() != work_date or checked_in.time() > cutoff:
+            status = "Late"
+        else:
+            status = "In office"
+        entries.append(
+            {
+                "name": name,
+                "status": status,
+                "checked_in_at": checked_in.strftime("%I:%M %p"),
+                "distance_meters": record["distance_meters"],
+                "details": record["details"],
+            }
+        )
+    summary = {
+        "in_office": sum(entry["status"] == "In office" for entry in entries),
+        "late": sum(entry["status"] == "Late" for entry in entries),
+        "outside": sum(entry["status"] == "Outside radius" for entry in entries),
+        "missing": sum(entry["status"] == "No check-in" for entry in entries),
+    }
+    return entries, summary
+
+
+def admin_password_configured():
+    return bool(os.environ.get("ADMIN_PASSWORD"))
+
+
 @app.route("/", methods=["GET"])
 def home():
     roster = get_roster()
-    return render_template(
-        "home.html",
-        roster=roster,
-        office_configured=configured_office() is not None,
+    response = app.make_response(
+        render_template(
+            "home.html",
+            roster=roster,
+            office_configured=configured_office() is not None,
+        )
     )
+    token, _, needs_cookie = get_device_identity()
+    if needs_cookie:
+        set_device_cookie(response, token)
+    return response
+
+
+@app.route("/admin", methods=["GET", "POST"])
+def admin():
+    if not admin_password_configured():
+        abort(503, "Admin access is not configured. Set ADMIN_PASSWORD in the WSGI file.")
+    if request.method == "POST":
+        supplied = request.form.get("password", "")
+        if not hmac.compare_digest(os.environ["ADMIN_PASSWORD"], supplied):
+            flash("That password was not correct.", "error")
+        else:
+            session["admin_authenticated"] = True
+            return redirect(url_for("admin"))
+    if not session.get("admin_authenticated"):
+        return render_template("admin_login.html")
+    selected_date = request.args.get("date", "")
+    if selected_date:
+        try:
+            work_date = datetime.strptime(selected_date, "%Y-%m-%d").date()
+        except ValueError:
+            abort(400, "Choose a valid date in YYYY-MM-DD format.")
+    else:
+        work_date = datetime.now(get_timezone()).date()
+    entries, summary = build_admin_day(work_date)
+    return render_template(
+        "admin.html",
+        entries=entries,
+        summary=summary,
+        selected_date=work_date.isoformat(),
+        timezone=str(get_timezone()),
+        cutoff=get_cutoff().strftime("%I:%M %p"),
+    )
+
+
+@app.route("/admin/send-report", methods=["POST"])
+def admin_send_report():
+    if not admin_password_configured():
+        abort(503, "Admin access is not configured. Set ADMIN_PASSWORD in the WSGI file.")
+    if not session.get("admin_authenticated"):
+        return redirect(url_for("admin"))
+
+    selected_date = request.form.get("date", "")
+    try:
+        work_date = datetime.strptime(selected_date, "%Y-%m-%d").date()
+    except ValueError:
+        abort(400, "Choose a valid date in YYYY-MM-DD format.")
+
+    try:
+        report = build_report(work_date)
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        app.logger.exception("Could not generate the attendance report.")
+        flash("The attendance report could not be generated.", "error")
+        return redirect(url_for("admin", date=work_date.isoformat()))
+
+    try:
+        send_attendance_email(report)
+    except (OSError, RuntimeError, ValueError, smtplib.SMTPException):
+        app.logger.exception("Could not email the attendance report.")
+        flash("The report could not be emailed. Check the email settings.", "error")
+    else:
+        flash(f"Attendance report for {work_date.isoformat()} was emailed.", "success")
+    return redirect(url_for("admin", date=work_date.isoformat()))
+
+
+@app.route("/admin/logout", methods=["POST"])
+def admin_logout():
+    session.pop("admin_authenticated", None)
+    return redirect(url_for("admin"))
 
 
 @app.route("/check-in", methods=["POST"])
@@ -273,21 +511,36 @@ def check_in():
         "distance_meters": round(distance),
         "details": details,
     }
+    device_token, device_key, needs_device_cookie = get_device_identity()
+    checkin["device_key"] = device_key
     try:
         get_db().execute(
             """
             INSERT INTO attendance
                 (roster_key, employee_name, work_date, checked_in_at_utc,
-                 status, distance_meters, details)
+                 status, distance_meters, details, device_key)
             VALUES
                 (:roster_key, :employee_name, :work_date, :checked_in_at_utc,
-                 :status, :distance_meters, :details)
+                 :status, :distance_meters, :details, :device_key)
             """,
             checkin,
         )
         get_db().commit()
     except sqlite3.IntegrityError:
         get_db().rollback()
+        device_record = get_db().execute(
+            """
+            SELECT employee_name FROM attendance
+            WHERE device_key = ? AND work_date = ?
+            """,
+            (device_key, checkin["work_date"]),
+        ).fetchone()
+        if device_record is not None:
+            flash(
+                f"This browser already checked in today as {device_record['employee_name']}.",
+                "error",
+            )
+            return redirect(url_for("home"))
         flash("You already checked in today. A second check-in was not recorded.", "error")
         return redirect(url_for("home"))
 
@@ -295,7 +548,10 @@ def check_in():
         flash(f"Check-in recorded: within the office radius ({round(distance)} m).", "success")
     else:
         flash(f"Check-in recorded: outside the office radius ({round(distance)} m).", "error")
-    return redirect(url_for("home"))
+    response = app.make_response(redirect(url_for("home")))
+    if needs_device_cookie:
+        set_device_cookie(response, device_token)
+    return response
 
 
 @app.route("/internal/report", methods=["POST"])

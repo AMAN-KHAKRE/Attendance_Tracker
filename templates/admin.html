@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Attendance dashboard · Team Attendance{% endblock %}
+{% block content %}
+  <section class="dashboard-top">
+    <div>
+      <span class="eyebrow">Admin dashboard</span>
+      <h1>Attendance overview</h1>
+      <p>{{ selected_date }} · {{ timezone }} · On-time cutoff {{ cutoff }}</p>
+    </div>
+    <div class="dashboard-actions">
+      <a href="{{ url_for('home') }}">Check-in page</a>
+      <form action="{{ url_for('admin_send_report') }}" method="post">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <input type="hidden" name="date" value="{{ selected_date }}">
+        <button type="submit">Email this report</button>
+      </form>
+      <form action="{{ url_for('admin_logout') }}" method="post">
+        <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+        <button class="button-secondary" type="submit">Sign out</button>
+      </form>
+    </div>
+  </section>
+
+  <section class="stats-grid" aria-label="Attendance summary">
+    <div class="stat-card present"><span>In office</span><strong>{{ summary.in_office }}</strong></div>
+    <div class="stat-card late"><span>Late</span><strong>{{ summary.late }}</strong></div>
+    <div class="stat-card outside"><span>Outside radius</span><strong>{{ summary.outside }}</strong></div>
+    <div class="stat-card"><span>No check-in</span><strong>{{ summary.missing }}</strong></div>
+  </section>
+
+  <section class="card">
+    <form class="date-filter" action="{{ url_for('admin') }}" method="get">
+      <div>
+        <label for="attendance-date">View a day</label>
+        <input id="attendance-date" type="date" name="date" value="{{ selected_date }}" required>
+      </div>
+      <button type="submit">Show records</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>Team check-ins</h2>
+    <div class="table-wrap">
+      <table class="attendance-table">
+        <thead>
+          <tr><th>Team member</th><th>Status</th><th>Check-in time</th><th>Distance</th><th>Details</th></tr>
+        </thead>
+        <tbody>
+          {% for entry in entries %}
+            <tr>
+              <td>{{ entry.name }}</td>
+              <td><span class="status-pill status-{{ entry.status|lower|replace(' ', '-') }}">{{ entry.status }}</span></td>
+              <td>{{ entry.checked_in_at or "—" }}</td>
+              <td>{% if entry.distance_meters is not none %}{{ entry.distance_meters }} m{% else %}—{% endif %}</td>
+              <td>{{ entry.details or "—" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

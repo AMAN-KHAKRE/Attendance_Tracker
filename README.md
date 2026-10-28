@@ -49,17 +49,15 @@ Run tests:
 python -m unittest -v
 ```
 
-## Free trial deployment: PythonAnywhere + GitHub Actions
+## Free trial deployment: PythonAnywhere
 
-This keeps the Python app and SQLite database. PythonAnywhere supplies an
-HTTPS link; GitHub Actions calls the protected report endpoint daily and sends
-the email using SMTP secrets.
+This keeps the Python app and SQLite database on PythonAnywhere, which supplies
+an HTTPS link. An administrator can email the report for the selected date
+from the protected admin dashboard.
 
 **Free-plan caveat:** PythonAnywhere currently says new free web apps expire
-after one month. GitHub's scheduled workflows can also start late, and are not
-an exact-time or guaranteed-delivery service. This is a free trial arrangement,
-not dependable long-term attendance infrastructure. If the service must run
-every day without manual renewal, use a paid always-on host and scheduler.
+after one month. This is a free trial arrangement, not dependable long-term
+attendance infrastructure.
 
 ### 1. Put the code in a private GitHub repository
 
@@ -69,11 +67,8 @@ Create a **private** repository and upload this project, including:
 - `requirements.txt`
 - `roster.txt`
 - the `templates` folder
-- `scripts/send_report.py`
-- `.github/workflows/daily-attendance-report.yml`
 
 Do not upload `.venv`, `attendance.sqlite3`, `attendance.db`, or secrets.
-The GitHub Actions workflow must be on the repository's default branch.
 
 ### 2. Create the PythonAnywhere web app
 
@@ -82,9 +77,7 @@ The GitHub Actions workflow must be on the repository's default branch.
    account. The account does not need a domain; it provides a
    `YOUR_USERNAME.pythonanywhere.com` HTTPS address.
 2. Upload the project files to a folder such as
-   `/home/YOUR_USERNAME/attendance-tracker`. Keep the `.github` folder in the
-   GitHub repository for the workflow; it does not need to be uploaded to
-   PythonAnywhere.
+   `/home/YOUR_USERNAME/attendance-tracker`.
 3. In a PythonAnywhere Bash console, install the requirements in a virtual
    environment:
 
@@ -97,7 +90,7 @@ The GitHub Actions workflow must be on the repository's default branch.
 4. In the PythonAnywhere **Web** tab, set the virtualenv to
    `/home/YOUR_USERNAME/.virtualenvs/attendance`.
 5. Edit the WSGI configuration file linked from the Web tab. Replace
-   `YOUR_USERNAME` and `GENERATE_A_LONG_RANDOM_REPORT_KEY`, then use:
+   `YOUR_USERNAME` and the example values, then use:
 
    ```python
    import os
@@ -109,61 +102,52 @@ The GitHub Actions workflow must be on the repository's default branch.
 
    os.environ["ATTENDANCE_DATABASE"] = "/home/YOUR_USERNAME/attendance.sqlite3"
    os.environ["ATTENDANCE_SECRET_KEY"] = "GENERATE_A_DIFFERENT_LONG_RANDOM_SECRET"
-   os.environ["REPORT_ACCESS_KEY"] = "GENERATE_A_LONG_RANDOM_REPORT_KEY"
+   os.environ["ADMIN_PASSWORD"] = "GENERATE_ANOTHER_LONG_RANDOM_ADMIN_PASSWORD"
    os.environ["SESSION_COOKIE_SECURE"] = "true"
+   os.environ["REPORT_TO"] = "recipient@example.com"
+   os.environ["SMTP_HOST"] = "smtp.gmail.com"
+   os.environ["SMTP_PORT"] = "587"
+   os.environ["SMTP_FROM"] = "sender@gmail.com"
+   os.environ["SMTP_USERNAME"] = "sender@gmail.com"
+   os.environ["SMTP_PASSWORD"] = "YOUR_EMAIL_PROVIDER_APP_PASSWORD"
 
    from app import app as application
    ```
 
    Generate random secrets in a local Python shell using
    `python -c "import secrets; print(secrets.token_hex(32))"`. Keep these
-   secrets private. The database is placed in your home folder, outside the
-   uploaded code, so code updates will not overwrite it.
+   secrets private. `ADMIN_PASSWORD` protects the attendance dashboard at
+   `https://YOUR_USERNAME.pythonanywhere.com/admin`; share it only with the
+   administrator. The public check-in page remains available without login.
+   The database is placed in your home folder, outside the uploaded code, so
+   code updates will not overwrite it.
 6. Save the WSGI file and press **Reload** on the Web tab. Open the HTTPS site
    shown on the Web tab and submit a test check-in. The SQLite database is
    created automatically.
 
-### 3. Add GitHub Actions secrets
-
-In the private GitHub repo, open **Settings → Secrets and variables → Actions**
-and add:
-
-| Secret | Value |
-| --- | --- |
-| `ATTENDANCE_REPORT_URL` | `https://YOUR_USERNAME.pythonanywhere.com/internal/report` |
-| `ATTENDANCE_REPORT_KEY` | The exact `REPORT_ACCESS_KEY` from the WSGI file |
-| `REPORT_TO` | `aman.khakre@capgemini.com` |
-| `SMTP_HOST` | Your email provider's SMTP server |
-| `SMTP_PORT` | Usually `587` |
-| `SMTP_FROM` | Sender email address |
-| `SMTP_USERNAME` | SMTP account username |
-| `SMTP_PASSWORD` | SMTP password or provider app password |
-
 For Gmail, use `smtp.gmail.com`, port `587`, your full Gmail address as
 username, and a Google **App Password** (not your normal Google password).
-Follow your email provider's security policy.
+Follow your email provider's security policy and keep the app password private.
+After changing the WSGI settings, save the file and press **Reload** on the
+PythonAnywhere Web tab. Confirm your hosting plan allows outbound SMTP
+connections to your email provider.
 
-### 4. Enable and test the daily email
+### 3. Email a report from the admin dashboard
 
-The workflow is scheduled for **9:05 AM India time** (`03:35 UTC`) every day.
-GitHub cron schedules are best-effort and can be delayed. To test it after
-9:00 AM India time, go to the repo's **Actions** tab, select **Daily attendance
-report**, and choose **Run workflow**. The endpoint deliberately refuses to
-produce the daily report before 9:00 AM local time. Check the workflow run
-logs and email inbox for errors. Keep the repository active: GitHub can
-disable scheduled workflows on inactive repositories.
+Open `https://YOUR_USERNAME.pythonanywhere.com/admin`, sign in, choose the
+report date, and select **Email this report**. The message goes to `REPORT_TO`
+and includes the in-office and action-required lists for that date. The
+application sends no scheduled or automatic emails.
 
-The email includes the in-office list and action-required list. It reads
-check-ins from SQLite, so an app reload or process restart does not erase
-them. Back up `attendance.sqlite3` from your PythonAnywhere home folder
-periodically; do not add it to GitHub.
+The report reads check-ins from SQLite, so an app reload or process restart
+does not erase them. Back up `attendance.sqlite3` from your PythonAnywhere home
+folder periodically; do not add it to GitHub.
 
 ## Limitations
 
 - PythonAnywhere free accounts have restrictions and a one-month web-app
   expiry according to its current documentation. Recheck the plan before
   relying on it.
-- GitHub Actions schedules are not guaranteed to start exactly at 9:05.
 - Without login, a user can check in under a teammate's name.
 - GPS may be inaccurate or spoofed.
 - SQLite is appropriate for a small team on one app instance. Do not run

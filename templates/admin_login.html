@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Admin access · Team Attendance{% endblock %}
+{% block content %}
+  <section class="card login-card">
+    <span class="eyebrow">Private area</span>
+    <h1>Admin access</h1>
+    <p>Sign in to view the team’s attendance records. This page is separate from the public check-in form.</p>
+    <form action="{{ url_for('admin') }}" method="post">
+      <input type="hidden" name="_csrf_token" value="{{ csrf_token() }}">
+      <label for="admin-password">Admin password</label>
+      <input id="admin-password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit">Open dashboard</button>
+    </form>
+  </section>
+{% endblock %}
